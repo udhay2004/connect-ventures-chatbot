@@ -144,8 +144,16 @@ function freshSession(sessionId) {
       name: null, targetCountries: [], targetCountry: null, currentCountry: null,
       servicesDiscussed: [], serviceNeeded: null, email: null, phone: null,
       companyName: null, conversationSummary: '',
+      // Skip flags — set when the user declines/stalls on a required onboarding
+      // field, so the conversation can move forward instead of looping forever.
+      nameSkipped: false, currentCountrySkipped: false, targetSkipped: false, contactSkipped: false,
     },
-    state: { phase: 'new', topicsDiscussed: [], lastMenu: null, leadSaved: false, contactNudgeSent: false },
+    state: {
+      phase: 'new', topicsDiscussed: [], lastMenu: null, leadSaved: false, contactNudgeSent: false,
+      // Counts consecutive turns where the user gave no new info for the
+      // current onboarding question — used to detect a stuck conversation.
+      stallCount: 0,
+    },
     createdAt: new Date(), lastActive: new Date(),
   };
 }
@@ -166,12 +174,17 @@ async function getSession(sessionId) {
   s.memory.name  = s.memory.name  || null;
   s.memory.email = s.memory.email || null;
   s.memory.phone = s.memory.phone || null;
+  s.memory.nameSkipped           = s.memory.nameSkipped           || false;
+  s.memory.currentCountrySkipped = s.memory.currentCountrySkipped || false;
+  s.memory.targetSkipped         = s.memory.targetSkipped         || false;
+  s.memory.contactSkipped        = s.memory.contactSkipped        || false;
   s.state = s.state || {};
   s.state.topicsDiscussed  = s.state.topicsDiscussed  || [];
   s.state.phase            = s.state.phase            || 'new';
   s.state.lastMenu         = s.state.lastMenu         || null;
   s.state.leadSaved        = s.state.leadSaved        || false;
   s.state.contactNudgeSent = s.state.contactNudgeSent || false;
+  s.state.stallCount       = s.state.stallCount       || 0;
   s.history = s.history || [];
   cSet(sessionId, s);
   return s;
@@ -303,6 +316,7 @@ const NAME_BLACKLIST = new Set([
   'follow','welcome','greetings','morning','evening','afternoon','regards','sincerely',
   'currently','previously','recently','immediately','directly','generally',
   'basically','essentially','specifically','particularly','primarily','mainly',
+  'skip','none','nothing','decline','declined','pass',
 ]);
 
 function toTitleCase(str) {
@@ -595,6 +609,12 @@ const SERVICE_MAP = {
 const EXPAND_INTENT_RE = /expand|incorporat|setup|set up|open|register|move|launch|start|going to|looking at|consider|want to|thinking about/i;
 const NEGATION_RE = /\b(not|never|don't|won't|no longer|excluding|except|avoid|against|instead of)\b/i;
 
+// Explicit decline/stall signal — used at the endpoint level (not inside
+// extractEntities) to detect when someone doesn't want to, or can't, answer
+// the current onboarding question, so we can offer a graceful skip instead
+// of silently re-asking the same question forever.
+const DECLINE_RE = /\b(i\s*don'?t\s*(?:want|wanna|know|have)|not\s*(?:sure|now|right\s*now|yet)|no\s*idea|skip|maybe\s*later|prefer\s*not|rather\s*not|none\s*of\s*your)\b/i;
+
 // ─────────────────────────────────────────────
 // PHASE-AWARE ENTITY EXTRACTION
 // Country/name interpretation now depends on which onboarding question
@@ -733,14 +753,16 @@ function parseMenuFromReply(reply) {
 // ─────────────────────────────────────────────
 // PHASE ENGINE — deterministic, derived purely from what's known.
 // This replaces the old advancePhase()/healPhase() pair (which could
-// drift and get "stuck") with a single source of truth.
+// drift and get "stuck") with a single source of truth. Skip flags count
+// the same as a filled field so a stalled/declined answer never traps the
+// conversation in one phase forever.
 // ─────────────────────────────────────────────
 function computePhase(mem) {
-  if (!mem.name) return 'onboarding_name';
-  if (!mem.currentCountry) return 'onboarding_current_country';
-  const hasTarget = mem.targetCountry || (mem.targetCountries && mem.targetCountries.length);
+  if (!mem.name && !mem.nameSkipped) return 'onboarding_name';
+  if (!mem.currentCountry && !mem.currentCountrySkipped) return 'onboarding_current_country';
+  const hasTarget = mem.targetCountry || (mem.targetCountries && mem.targetCountries.length) || mem.targetSkipped;
   if (!hasTarget) return 'onboarding_country';
-  if (!mem.email && !mem.phone) return 'onboarding_contact';
+  if (!mem.email && !mem.phone && !mem.contactSkipped) return 'onboarding_contact';
   return 'advisory';
 }
 function syncPhase(session) {
@@ -749,19 +771,47 @@ function syncPhase(session) {
   if (prev !== session.state.phase) console.log('🔧 Phase: ' + prev + ' → ' + session.state.phase);
 }
 function onboardingPrompt(mem) {
+  const name = mem.name || null;
   switch (computePhase(mem)) {
     case 'onboarding_name':
       return 'Hi there! 👋 Welcome to Connect Ventures. I\'m your global expansion advisor — here to help across our 5C framework: Coaching, Consulting, Connecting, Collaboration, and Co-creation.\n\nBefore we dive in — who am I speaking with?';
     case 'onboarding_current_country':
-      return `Nice to meet you, ${mem.name}! 🌟\n\nWhere are you currently based? (e.g. India, Philippines, UAE, USA, UK, Singapore)`;
+      return `Nice to meet you${name ? ', ' + name : ''}! 🌟\n\nWhere are you currently based? (e.g. India, Philippines, UAE, USA, UK, Singapore)`;
     case 'onboarding_country':
-      return `Got it, ${mem.name}! 🌍\n\nAnd which country or market are you looking to expand into? (e.g. USA, UK, UAE, Singapore, or a region like ASEAN, EU, GCC)`;
+      return `Got it${name ? ', ' + name : ''}! 🌍\n\nAnd which country or market are you looking to expand into? (e.g. USA, UK, UAE, Singapore, or a region like ASEAN, EU, GCC)`;
     case 'onboarding_contact': {
-      const target = mem.targetCountry || (mem.targetCountries && mem.targetCountries[0]) || 'your target market';
-      return `Great choice, ${mem.name}! ${target} is an excellent market for expansion. 🌍\n\nBefore we dive deeper, could I grab your email or WhatsApp number? Please include the country code for your phone (e.g. +91 India, +1 USA, +971 UAE, +63 Philippines, +65 Singapore). Our team will use it to send you a custom quote and specific insights for ${target}.`;
+      const target = mem.targetCountry || (mem.targetCountries && mem.targetCountries[0]) || null;
+      const marketLine = target ? `${target} is an excellent market for expansion. 🌍` : `Let's get you connected with the right team. 🌍`;
+      return `Great choice${name ? ', ' + name : ''}! ${marketLine}\n\nBefore we dive deeper, could I grab your email or WhatsApp number? Please include the country code for your phone (e.g. +91 India, +1 USA, +971 UAE, +63 Philippines, +65 Singapore). Our team will use it to send you a custom quote and specific insights${target ? ' for ' + target : ''}.`;
     }
     default: return null;
   }
+}
+
+// Shown the FIRST time a given onboarding question stalls (no new info
+// extracted, same phase as before) — invites the user to answer again or
+// explicitly skip, instead of blindly repeating the original question.
+function buildStallHelp(phase) {
+  switch (phase) {
+    case 'onboarding_name':
+      return 'No pressure! If you\'d rather not share your name, just say "skip" and I\'ll go ahead without it — otherwise, let me know what to call you.';
+    case 'onboarding_current_country':
+      return 'No worries — even a rough idea helps (e.g. "India" or "UAE"). Say "skip" if you\'d rather not share where you\'re based.';
+    case 'onboarding_country':
+      return 'That\'s okay — you don\'t need a specific market picked out yet. Name any country or region you\'re curious about, or say "skip" and I\'ll go ahead without one.';
+    case 'onboarding_contact':
+      return 'No problem — I can still answer your questions without contact info for now. Share your email or phone anytime, or say "skip" to continue.';
+    default:
+      return null;
+  }
+}
+
+// Used when skipping the CURRENT (last remaining) onboarding field lands
+// us straight into advisory — gives a clean transition instead of running
+// the word "skip" through Claude as if it were a real question.
+function buildAdvisorHandoff(mem) {
+  const name = mem.name || 'there';
+  return `No problem, ${name}! Let's get you the information you need. 😊\n\nWant to explore further?\n1️⃣ How does company registration work abroad?\n2️⃣ What are typical costs and timelines?\n3️⃣ How does Connect Ventures' 5C framework help my business?\n4️⃣ I have a different question`;
 }
 
 // ─────────────────────────────────────────────
@@ -773,6 +823,7 @@ function buildContextBlock(mem, state) {
   else lines.push('CRITICAL: You do NOT know this user\'s name yet. Do NOT address them by any name. Use "there" or omit entirely.');
   const countries = (mem.targetCountries && mem.targetCountries.length) ? mem.targetCountries : (mem.targetCountry ? [mem.targetCountry] : []);
   if (countries.length) lines.push('Markets discussed: ' + countries.join(', '));
+  else if (mem.targetSkipped) lines.push('User has not picked a target market yet (they chose to skip this) — do not assume one.');
   if (mem.currentCountry) lines.push('Based in: ' + mem.currentCountry);
   const services = (mem.servicesDiscussed && mem.servicesDiscussed.length) ? mem.servicesDiscussed : (mem.serviceNeeded ? [mem.serviceNeeded] : []);
   if (services.length) lines.push('Services discussed: ' + services.join(', '));
@@ -823,7 +874,7 @@ CRITICAL NAME RULES:
 - ONLY use a name if [USER CONTEXT] explicitly confirms it. Never invent one, never derive it from an email/phone/country/region name.
 
 FIRST MESSAGE BEHAVIOR:
-- The onboarding questions are handled deterministically outside of you — you will only ever be called once onboarding (name, current country, target market, contact) is already complete. Do not re-ask onboarding questions.
+- The onboarding questions are handled deterministically outside of you — you will only ever be called once onboarding (name, current country, target market, contact) is already complete or explicitly skipped. Do not re-ask onboarding questions. If [USER CONTEXT] shows a field was skipped, don't push on it — just help with what they actually asked.
 
 ADVISORY RESPONSES:
 - Answer from the knowledge base sections provided. If unsure which of the 5 Cs applies, ask a clarifying question or briefly explain the relevant module(s).
@@ -1084,7 +1135,7 @@ app.post('/api/chat', async function(req, res) {
     if (priorPhase === 'onboarding_country' && !updates.targetCountry) {
       const attempted = matchCountryKeyword(message.toLowerCase());
       if (attempted && attempted.country === mem.currentCountry) {
-        const clarify = `It looks like ${attempted.country} is where you're currently based, ${mem.name}. Which country are you looking to *expand into*? For example: USA, UK, UAE, Singapore, ASEAN, or another market.`;
+        const clarify = `It looks like ${attempted.country} is where you're currently based${mem.name ? ', ' + mem.name : ''}. Which country are you looking to *expand into*? For example: USA, UK, UAE, Singapore, ASEAN, or another market.`;
         session.history.push({ role: 'assistant', content: truncateMsg(clarify) });
         await saveSession(session);
         return res.json({ reply: clarify, sessionId, menu: null, phase: state.phase });
@@ -1129,9 +1180,41 @@ app.post('/api/chat', async function(req, res) {
       return res.json({ reply: memoryReply, sessionId, menu: null, phase: state.phase });
     }
 
-    // Still onboarding — ask exactly the next required question, nothing else
+    // Still onboarding — detect stalls/declines and offer a graceful skip
+    // instead of silently repeating the same question forever.
     if (state.phase !== 'advisory') {
-      const prompt = onboardingPrompt(mem);
+      const lowerMsg = message.toLowerCase();
+      const gotNothingNew = Object.keys(updates).length === 0;
+      const isStall = gotNothingNew && state.phase === priorPhase;
+      const explicitDecline = DECLINE_RE.test(lowerMsg);
+
+      state.stallCount = isStall ? (state.stallCount || 0) + 1 : 0;
+
+      let justSkipped = false;
+      if (isStall && (explicitDecline || state.stallCount >= 2)) {
+        if (state.phase === 'onboarding_name')                 mem.nameSkipped = true;
+        else if (state.phase === 'onboarding_current_country') mem.currentCountrySkipped = true;
+        else if (state.phase === 'onboarding_country')         mem.targetSkipped = true;
+        else if (state.phase === 'onboarding_contact')         mem.contactSkipped = true;
+        state.stallCount = 0;
+        syncPhase(session);
+        justSkipped = true;
+        console.log('⏭️  Skipped onboarding field, new phase: ' + state.phase);
+      }
+
+      if (justSkipped && state.phase === 'advisory') {
+        // Skipping the last remaining field lands us straight in advisory —
+        // give a clean transition rather than running "skip" through Claude.
+        const handoff = buildAdvisorHandoff(mem);
+        session.history.push({ role: 'assistant', content: truncateMsg(handoff) });
+        const menu = parseMenuFromReply(handoff);
+        if (menu) state.lastMenu = { options: menu, context: 'onboarding_skipped', createdAt: Date.now() };
+        await saveSession(session);
+        triggerProgressiveSave(session);
+        return res.json({ reply: handoff, sessionId, menu: null, phase: state.phase });
+      }
+
+      const prompt = (isStall && !justSkipped) ? buildStallHelp(state.phase) : onboardingPrompt(mem);
       session.history.push({ role: 'assistant', content: truncateMsg(prompt) });
       await saveSession(session);
       triggerProgressiveSave(session);
@@ -1237,7 +1320,7 @@ app.get('/', function(req, res) { res.sendFile(path.join(__dirname, 'public', 'i
 const PORT = process.env.PORT || 5000;
 connectMongo().then(function() {
   app.listen(PORT, function() {
-    console.log('\n🚀 Connect Ventures Website Bot v1.0 — phase-aware, region-safe extraction');
+    console.log('\n🚀 Connect Ventures Website Bot v1.1 — phase-aware, region-safe, stall-safe extraction');
     console.log('📡 Port: ' + PORT);
     console.log('💬 POST /api/chat');
     console.log('❤️  GET  /health\n');
