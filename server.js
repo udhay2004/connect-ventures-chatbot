@@ -153,6 +153,10 @@ function freshSession(sessionId) {
       // Counts consecutive turns where the user gave no new info for the
       // current onboarding question — used to detect a stuck conversation.
       stallCount: 0,
+      // Set when we've asked "did you mean to change your name to X?" —
+      // the NEXT message is interpreted as a yes/no answer to that, not
+      // as a normal chat turn.
+      pendingNameConfirm: null,
     },
     createdAt: new Date(), lastActive: new Date(),
   };
@@ -185,6 +189,7 @@ async function getSession(sessionId) {
   s.state.leadSaved        = s.state.leadSaved        || false;
   s.state.contactNudgeSent = s.state.contactNudgeSent || false;
   s.state.stallCount       = s.state.stallCount       || 0;
+  if (typeof s.state.pendingNameConfirm === 'undefined') s.state.pendingNameConfirm = null;
   s.history = s.history || [];
   cSet(sessionId, s);
   return s;
@@ -374,6 +379,58 @@ function stripHallucinatedName(reply, knownName) {
     .replace(/\b(Hi|Hello|Hey|Thanks|Perfect|Sure|Great|Absolutely|Of course|Certainly|Welcome back),?\s+[A-Z][a-z]{1,20}[,!.]/g, (m, w) => w + '!')
     .replace(/\b(Hi|Hello|Hey)\s+[A-Z][a-z]{1,20}[,!.]/g, (m, w) => w + ' there!');
 }
+
+// ─────────────────────────────────────────────
+// NAME CORRECTION — handled deterministically, never left to the LLM.
+// A name is already on file, so any of these are candidate corrections:
+//   - "actually my name is Shreya" / "no, I'm Shreya" (explicit cue word)
+//     → applied immediately, no confirmation needed.
+//   - bare "Shreya" typed alone with a name already on file (no cue word)
+//     → ambiguous, so we ASK before overwriting instead of guessing.
+// This is what was missing before: without it, a stale/reused session
+// would carry the old name into advisory phase and leave Claude to
+// improvise a response to what looked like a name mismatch.
+// ─────────────────────────────────────────────
+const NAME_CORRECTION_CUE_RE = /\b(actually|no[,]?\s|not\s|instead|wrong|mistake|typo|correct(?:ion)?|really)\b/i;
+
+function detectNameCorrection(msg, mem) {
+  if (!mem.name) return null;
+  const t = msg.trim();
+  if (t.length > 140 || t.includes('?') || /\d/.test(t)) return null;
+  const lower = t.toLowerCase();
+
+  function validate(candidate) {
+    const words = candidate.trim().split(/\s+/);
+    if (words.length > 3) return null;
+    const ok = words.every(w =>
+      w.length >= 2 && !NAME_BLACKLIST.has(w.toLowerCase()) &&
+      !ALL_COUNTRY_WORDS.has(w.toLowerCase()) && /^[A-Za-z'\-]+$/.test(w)
+    );
+    if (!ok) return null;
+    const titled = toTitleCase(candidate.trim());
+    return titled.toLowerCase() === mem.name.toLowerCase() ? null : titled;
+  }
+
+  const introMatch = t.match(NAME_INTRO_RE);
+  if (introMatch) {
+    const candidate = validate(introMatch[1]);
+    if (candidate) return { candidate, confident: NAME_CORRECTION_CUE_RE.test(lower) };
+  }
+
+  const standaloneMatch = t.match(NAME_STANDALONE_RE);
+  if (standaloneMatch) {
+    const candidate = validate(standaloneMatch[1]);
+    if (candidate) return { candidate, confident: false };
+  }
+
+  return null;
+}
+
+// Lets a user (or a tester) explicitly restart a stuck/stale session
+// without needing to clear browser storage or hit the /reset endpoint.
+const RESET_RE = /^\s*(reset|restart|start\s*over|start\s*again|new\s*session|clear\s*(?:my\s*)?(?:data|info|chat))\s*[.!]?\s*$/i;
+const AFFIRM_RE = /^\s*(yes|yeah|yep|yup|correct|right|please|sure|ok(?:ay)?|update\s*it|do\s*it|go\s*ahead)\b/i;
+const DENY_RE   = /^\s*(no|nope|nah|don'?t|keep\s*it|leave\s*it|ignore|never\s*mind|cancel)\b/i;
 
 // ─────────────────────────────────────────────
 // EMAIL EXTRACTION & VALIDATION
@@ -872,6 +929,7 @@ PERSONALITY:
 
 CRITICAL NAME RULES:
 - ONLY use a name if [USER CONTEXT] explicitly confirms it. Never invent one, never derive it from an email/phone/country/region name.
+- Name corrections are normally handled before you're even called. If you still see what looks like a different name than the one on file, do NOT lecture the user about "the name on file" — just warmly ask a one-line clarifying question (e.g. "Did you want me to update your name to that?") and move on.
 
 FIRST MESSAGE BEHAVIOR:
 - The onboarding questions are handled deterministically outside of you — you will only ever be called once onboarding (name, current country, target market, contact) is already complete or explicitly skipped. Do not re-ask onboarding questions. If [USER CONTEXT] shows a field was skipped, don't push on it — just help with what they actually asked.
@@ -1105,10 +1163,67 @@ app.post('/api/chat', async function(req, res) {
     const session = await getSession(sessionId);
     const mem = session.memory, state = session.state;
 
+    // Explicit reset — lets a stuck/stale session recover without needing
+    // to clear browser storage or hit /reset out-of-band.
+    if (RESET_RE.test(message)) {
+      const freshMem = freshSession(sessionId).memory;
+      const freshState = freshSession(sessionId).state;
+      Object.assign(mem, freshMem);
+      Object.assign(state, freshState);
+      session.history = [];
+      const greeting = onboardingPrompt(mem);
+      session.history.push({ role: 'assistant', content: truncateMsg(greeting) });
+      await saveSession(session);
+      return res.json({ reply: greeting, sessionId, menu: null, phase: state.phase });
+    }
+
+    // Resolving a pending "did you want me to update your name?" question
+    // takes priority over everything else this turn.
+    if (state.pendingNameConfirm) {
+      const candidate = state.pendingNameConfirm;
+      state.pendingNameConfirm = null;
+      let reply;
+      if (AFFIRM_RE.test(message)) {
+        mem.name = candidate;
+        reply = `Got it — I'll call you ${candidate} from here on! 😊 What would you like to know?`;
+      } else if (DENY_RE.test(message)) {
+        reply = `No problem, I'll keep calling you ${mem.name}. What would you like to know?`;
+      } else {
+        // Didn't clearly answer yes/no — re-ask once, then fall through
+        // to treating their message normally next turn if they ignore it.
+        state.pendingNameConfirm = candidate;
+        reply = `Just to confirm — should I update your name from ${mem.name} to ${candidate}? (yes/no)`;
+      }
+      session.history.push({ role: 'user', content: truncateMsg(message) });
+      session.history.push({ role: 'assistant', content: truncateMsg(reply) });
+      await saveSession(session);
+      return res.json({ reply, sessionId, menu: null, phase: state.phase });
+    }
+
     syncPhase(session); // normalizes the initial 'new' phase into the correct one
     const priorPhase = state.phase;
 
     console.log('\n📩 [' + sessionId.slice(-8) + '] Phase: ' + priorPhase + ', Msg: "' + message.substring(0,60) + '"');
+
+    // Name correction — checked BEFORE normal extraction, and only when a
+    // name is already on file (otherwise this is just ordinary onboarding).
+    if (mem.name) {
+      const correction = detectNameCorrection(message, mem);
+      if (correction) {
+        session.history.push({ role: 'user', content: truncateMsg(message) });
+        let reply;
+        if (correction.confident) {
+          mem.name = correction.candidate;
+          reply = `Got it — I'll call you ${correction.candidate} from here on! 😊 What would you like to know?`;
+        } else {
+          state.pendingNameConfirm = correction.candidate;
+          reply = `Just to confirm — should I update your name from ${mem.name} to ${correction.candidate}? (yes/no)`;
+        }
+        session.history.push({ role: 'assistant', content: truncateMsg(reply) });
+        await saveSession(session);
+        return res.json({ reply, sessionId, menu: null, phase: state.phase });
+      }
+    }
 
     const { updates, validationError } = await extractEntities(message, mem, priorPhase);
 
