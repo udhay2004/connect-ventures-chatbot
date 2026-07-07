@@ -337,7 +337,7 @@ const NAME_BLACKLIST = new Set([
   'follow','welcome','greetings','morning','evening','afternoon','regards','sincerely',
   'currently','previously','recently','immediately','directly','generally',
   'basically','essentially','specifically','particularly','primarily','mainly',
-  'skip','none','nothing','decline','declined','pass',
+  'skip','none','nothing','decline','declined','pass','only','plan','planning',
 ]);
 
 function toTitleCase(str) {
@@ -364,7 +364,7 @@ function extractName(msg) {
   if (t.length > 140) return null;
   if (t.includes('?')) return null;
   const lower = t.toLowerCase();
-  if (/tell me|about|incorporat|setup|need|tax|bank|fema|odi|visa|compli|register|jurisdict/.test(lower)) return null;
+  if (/tell me|about|incorporat|setup|need|tax|bank|fema|odi|visa|compli|register|jurisdict|expand|market/.test(lower)) return null;
   if (/(punjabi|gujarati|marathi|bengali|tamil|telugu|sikh|hindu|muslim|christian|fan|lover|obsessed|huge)/i.test(lower)) return null;
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
   if (/\d/.test(t)) return null;
@@ -1179,6 +1179,22 @@ app.post('/api/chat', async function(req, res) {
     const session = await getSession(sessionId);
     const mem = session.memory, state = session.state;
 
+    // ── STALE-SESSION GUARD ──────────────────────────────────────────
+    // A session with zero chat history should also have empty memory —
+    // that's the only way freshSession() ever produces one. If we find
+    // history.length === 0 but memory already has a name/email/phone on
+    // it, this sessionId was reused from an earlier, unrelated
+    // conversation (e.g. a stale value from localStorage). To the
+    // person typing right now, this LOOKS like a brand-new chat, so
+    // treat it as one instead of asking "should I rename you from X?"
+    // for a name they never gave us in this conversation.
+    if (session.history.length === 0 && (mem.name || mem.email || mem.phone)) {
+      console.warn('⚠️ Stale memory on empty-history session ' + sessionId + ' — resetting identity fields.');
+      const fresh = freshSession(sessionId);
+      Object.assign(mem, fresh.memory);
+      Object.assign(state, fresh.state);
+    }
+
     // Explicit reset — lets a stuck/stale session recover without needing
     // to clear browser storage or hit /reset out-of-band.
     if (RESET_RE.test(message)) {
@@ -1222,8 +1238,9 @@ app.post('/api/chat', async function(req, res) {
     console.log('\n📩 [' + sessionId.slice(-8) + '] Phase: ' + priorPhase + ', Msg: "' + message.substring(0,60) + '"');
 
     // Name correction — checked BEFORE normal extraction, and only when a
-    // name is already on file (otherwise this is just ordinary onboarding).
-    if (mem.name) {
+    // name is already on file AND there's real prior history in this
+    // conversation (see STALE-SESSION GUARD above for why history matters).
+    if (mem.name && session.history.length > 0) {
       const correction = detectNameCorrection(message, mem);
       if (correction) {
         session.history.push({ role: 'user', content: truncateMsg(message) });
@@ -1398,6 +1415,59 @@ app.post('/api/chat', async function(req, res) {
 app.post('/chat', function(req, res) { req.url = '/api/chat'; app._router.handle(req, res); });
 
 // ─────────────────────────────────────────────
+// STRUCTURED CONTACT FORM — used by an inline chat form (instead of the
+// user typing name/email/phone as free text). Skips extractName /
+// extractEmailFromText / extractPhoneFromText entirely, so it can't be
+// misparsed the way free-text messages sometimes are — the values come
+// straight from labeled form fields, validated the same way as chat input.
+// ─────────────────────────────────────────────
+app.post('/api/chat/contact-form', async function(req, res) {
+  try {
+    const { sessionId, name, email, phone, companyName } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+    const session = await getSession(sessionId);
+    const mem = session.memory;
+
+    if (name && name.trim()) mem.name = toTitleCase(name.trim());
+    if (companyName && companyName.trim()) mem.companyName = companyName.trim();
+
+    const errors = {};
+    if (email && email.trim()) {
+      const check = await validateEmail(email.trim());
+      if (check.valid) mem.email = check.cleaned;
+      else errors.email = getEmailFeedback(check.reason, mem.name);
+    }
+    if (phone && phone.trim()) {
+      const check = validatePhone(phone.trim(), mem.currentCountry);
+      if (check.valid) mem.phone = check.cleaned;
+      else errors.phone = getPhoneFeedback(check.reason, mem.name);
+    }
+    if (Object.keys(errors).length) {
+      return res.json({ success: false, errors });
+    }
+
+    syncPhase(session);
+    await saveSession(session);
+
+    if (mem.email || mem.phone) {
+      await saveLeadData(session, true);
+      await appendToSheet(session);
+      if (!session.state.leadSaved) {
+        session.state.leadSaved = true;
+        await sendLeadEmail(session);
+        await saveSession(session);
+      }
+    }
+
+    res.json({ success: true, phase: session.state.phase, name: mem.name });
+  } catch (err) {
+    console.error('❌ contact-form error:', err.message);
+    res.status(500).json({ error: 'Could not save contact info.' });
+  }
+});
+
+// ─────────────────────────────────────────────
 // ADMIN ENDPOINTS
 // ─────────────────────────────────────────────
 app.get('/health', function(req, res) {
@@ -1451,9 +1521,10 @@ app.get('/', function(req, res) { res.sendFile(path.join(__dirname, 'public', 'i
 const PORT = process.env.PORT || 5000;
 connectMongo().then(function() {
   app.listen(PORT, function() {
-    console.log('\n🚀 Connect Ventures Website Bot v1.1 — phase-aware, region-safe, stall-safe extraction');
+    console.log('\n🚀 Connect Ventures Website Bot v1.2 — phase-aware, region-safe, stall-safe, stale-session-safe extraction');
     console.log('📡 Port: ' + PORT);
     console.log('💬 POST /api/chat');
+    console.log('📝 POST /api/chat/contact-form');
     console.log('❤️  GET  /health\n');
     startKeepAlive();
   });
