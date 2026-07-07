@@ -106,9 +106,25 @@ async function connectMongo() {
   }
 }
 
+// Cooldown between reconnect attempts. Without this, every single chat
+// message while Mongo is down triggers a fresh connection attempt with a
+// 10s serverSelectionTimeoutMS — meaning every reply the user sees eats a
+// silent 10-second delay. This was almost certainly the actual cause of
+// "the chatbot is very slow": it wasn't Claude being slow, it was a
+// doomed Mongo reconnect attempt blocking every single turn.
+let lastMongoAttempt = 0;
+const MONGO_RETRY_COOLDOWN_MS = 30000; // only retry once per 30s
+
 async function ensureMongo() {
   if (mongoOk && sessionsCol && leadsCol) return true;
   if (!MONGODB_URI) return false;
+  const now = Date.now();
+  if (now - lastMongoAttempt < MONGO_RETRY_COOLDOWN_MS) {
+    // Still in cooldown from a recent failed attempt — fail fast instead
+    // of blocking this chat turn on another doomed connection attempt.
+    return false;
+  }
+  lastMongoAttempt = now;
   console.log('🔄 Attempting MongoDB reconnect...');
   await connectMongo();
   return mongoOk;
