@@ -342,6 +342,22 @@ async function validateEmail(rawInput, options) {
     'dispostable.com','maildrop.cc','mailnull.com','test.in',
   ]);
   if (FAKE_DOMAINS.has(domain)) return { valid: false, reason: 'fake_domain', attempted: trimmed };
+  // Heuristic for obvious keyboard-mash / placeholder local-parts at a
+  // REAL provider (e.g. "asdfgh@gmail.com", "test123@gmail.com"). DNS/MX
+  // checks only confirm the domain accepts mail, not that this specific
+  // mailbox is real — that requires actually sending a verification code,
+  // which this function doesn't do. This heuristic catches the common
+  // "typed junk to get past the form" case without false-flagging normal
+  // addresses like "john.smith92@gmail.com".
+  const localPart = trimmed.split('@')[0];
+  const PLACEHOLDER_LOCAL_RE = /^(test|asdf|qwerty|abcd?|xxx+|aaa+|fake|dummy|sample|noone|nobody|temp|foo|bar|none|na|notreal|placeholder)\d*$/i;
+  const KEYBOARD_MASH_RE = /asdf|qwerty|zxcv|qazwsx|1qaz|poiuy/i;
+  const distinctLetters = new Set(localPart.replace(/[^a-z]/gi, '').toLowerCase()).size;
+  if (PLACEHOLDER_LOCAL_RE.test(localPart) ||
+      (localPart.length <= 12 && KEYBOARD_MASH_RE.test(localPart)) ||
+      (localPart.length >= 5 && distinctLetters <= 2)) {
+    return { valid: false, reason: 'suspicious_local_part', attempted: trimmed };
+  }
   if (!options.skipDNS) {
     try {
       const controller = new AbortController();
@@ -369,6 +385,19 @@ const CC_LOCAL_DIGITS = {
   '51':9,'52':10,'54':10,'55':11,'56':9,'57':10,'58':10,'61':9,'90':10,'98':10,'212':9,'213':9,
   '216':8,'218':9,'221':9,'233':9,'234':10,'237':9,'254':9,'255':9,'256':9,'260':9,'263':9,
   '264':9,'265':9,'266':8,'267':8,'250':9,'251':9,'252':[7,8],'258':9,'225':8,'372':[7,8],
+  // Extra codes so a real-but-less-common country isn't wrongly rejected
+  // now that an unrecognized code is treated as invalid rather than valid.
+  '353':9,'354':7,'352':9,'357':8,'358':[9,10],'420':9,'421':9,'423':9,
+  '370':8,'371':8,'373':8,'374':8,'375':9,'376':6,'377':8,'378':10,
+  '380':9,'381':9,'382':8,'385':9,'386':8,'387':8,'389':8,
+  '350':8,'351':9,'356':8,'359':9,'240':9,'241':7,'242':9,'243':9,'244':9,
+  '245':7,'248':7,'249':9,'253':6,'257':8,'268':8,'269':7,'290':4,
+  '297':7,'298':6,'299':6,'670':8,'673':7,'675':8,'676':7,'677':7,
+  '679':7,'680':7,'681':6,'682':5,'685':7,'686':8,'687':6,'688':6,'689':8,
+  '850':[8,10],'855':9,'856':10,'963':9,'967':9,'970':9,'992':9,'993':8,
+  '994':9,'995':9,'996':9,'998':9,'54':10,'53':8,'591':8,'592':7,'593':9,
+  '594':9,'595':9,'596':9,'597':7,'598':8,'599':7,'500':5,'501':7,'502':8,
+  '503':8,'504':8,'505':8,'506':8,'507':8,'508':6,'509':8,
 };
 
 function resolveCallingCode(digits) {
@@ -402,17 +431,24 @@ function validatePhone(rawPhone, currentCountry) {
     if (digitsOnly.length > 15) return { valid: false, reason: 'too_long', cleaned: null };
     if (/^(.)\1{7,}$/.test(digitsOnly)) return { valid: false, reason: 'placeholder', cleaned: null };
     const cc = resolveCallingCode(digitsOnly);
-    if (cc) {
-      const localDigits = digitsOnly.slice(cc.length);
-      const rule = CC_LOCAL_DIGITS[cc];
-      if (typeof rule === 'number') {
-        if (localDigits.length < rule) return { valid: false, reason: 'too_short', cleaned: null };
-        if (localDigits.length > rule) return { valid: false, reason: 'too_long', cleaned: null };
-      } else if (Array.isArray(rule)) {
-        if (localDigits.length < rule[0]) return { valid: false, reason: 'too_short', cleaned: null };
-        if (localDigits.length > rule[1]) return { valid: false, reason: 'too_long', cleaned: null };
-      }
+    if (!cc) {
+      // Previously this silently fell through to "valid" when the calling
+      // code wasn't in our table — meaning a bogus/nonexistent country
+      // code was ACCEPTED instead of rejected. An unrecognized code is a
+      // strong signal of a mistyped number, so reject and ask them to
+      // double-check it rather than assume it's fine.
+      return { valid: false, reason: 'unrecognized_country_code', cleaned: null };
     }
+    const localDigits = digitsOnly.slice(cc.length);
+    const rule = CC_LOCAL_DIGITS[cc];
+    if (typeof rule === 'number') {
+      if (localDigits.length < rule) return { valid: false, reason: 'too_short', cleaned: null };
+      if (localDigits.length > rule) return { valid: false, reason: 'too_long', cleaned: null };
+    } else if (Array.isArray(rule)) {
+      if (localDigits.length < rule[0]) return { valid: false, reason: 'too_short', cleaned: null };
+      if (localDigits.length > rule[1]) return { valid: false, reason: 'too_long', cleaned: null };
+    }
+    if (/^(.)\1+$/.test(localDigits)) return { valid: false, reason: 'placeholder', cleaned: null };
     return { valid: true, reason: null, cleaned: '+' + digitsOnly };
   }
   if (digitsOnly.startsWith('0') && digitsOnly.length >= 9 && digitsOnly.length <= 12) {
