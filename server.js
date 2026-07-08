@@ -304,9 +304,13 @@ function matchCountryKeyword(lowerText) {
 // NAME EXTRACTION
 // Fixed to: (1) not require the whole message to be just the name, so
 // "hi im ahtisa from ph" now correctly yields "Ahtisa" instead of failing
-// entirely, and (2) never even attempt to run outside the name-onboarding
-// step (see extractEntities), so a later reply like "expand to asean" can
-// never again be mistaken for someone's name.
+// entirely, (2) never even attempt to run outside the name-onboarding
+// step (see extractEntities), and (3) — NEW — fall back to progressively
+// shorter prefixes of the captured phrase instead of discarding the whole
+// match the instant ANY trailing word fails validation. This is what was
+// causing "im ari my friends call me ariadna" to yield NO name at all:
+// the greedy 3-word capture "ari my friends" failed because "my" is
+// blacklisted, and the old code never retried with just "ari".
 // ─────────────────────────────────────────────
 const NAME_BLACKLIST = new Set([
   'hi','hello','hey','okay','ok','yes','no','sure','thanks','thank','please',
@@ -338,6 +342,7 @@ const NAME_BLACKLIST = new Set([
   'currently','previously','recently','immediately','directly','generally',
   'basically','essentially','specifically','particularly','primarily','mainly',
   'skip','none','nothing','decline','declined','pass','only','plan','planning',
+  'friends','friend','call','calls','called',
 ]);
 
 function toTitleCase(str) {
@@ -370,21 +375,41 @@ function extractName(msg) {
   if (/\d/.test(t)) return null;
   if (/@/.test(t) || /my mail|my email|my number|my phone|whatsapp/i.test(lower)) return null;
 
-  function validWords(candidate) {
-    const words = candidate.split(/\s+/);
-    return words.length <= 3 && words.every(w =>
+  function tryValidate(words) {
+    if (!words.length || words.length > 3) return null;
+    const ok = words.every(w =>
       w.length >= 2 &&
       !NAME_BLACKLIST.has(w.toLowerCase()) &&
       !ALL_COUNTRY_WORDS.has(w.toLowerCase()) &&
       /^[A-Za-z'\-]+$/.test(w)
     );
+    return ok ? toTitleCase(words.join(' ')) : null;
+  }
+
+  // Try the full captured phrase first, then progressively drop trailing
+  // words one at a time. This lets "ari my friends call me ariadna"
+  // resolve to "Ari" instead of failing outright just because "my" /
+  // "friends" happened to follow it in the same capture group.
+  function bestPrefix(candidate) {
+    const words = candidate.trim().split(/\s+/);
+    for (let n = words.length; n >= 1; n--) {
+      const result = tryValidate(words.slice(0, n));
+      if (result) return result;
+    }
+    return null;
   }
 
   const intro = t.match(NAME_INTRO_RE);
-  if (intro && validWords(intro[1].trim())) return toTitleCase(intro[1].trim());
+  if (intro) {
+    const result = bestPrefix(intro[1]);
+    if (result) return result;
+  }
 
   const standalone = t.match(NAME_STANDALONE_RE);
-  if (standalone && validWords(standalone[1].trim())) return toTitleCase(standalone[1].trim());
+  if (standalone) {
+    const result = bestPrefix(standalone[1]);
+    if (result) return result;
+  }
 
   return null;
 }
@@ -686,7 +711,7 @@ const NEGATION_RE = /\b(not|never|don't|won't|no longer|excluding|except|avoid|a
 // extractEntities) to detect when someone doesn't want to, or can't, answer
 // the current onboarding question, so we can offer a graceful skip instead
 // of silently re-asking the same question forever.
-const DECLINE_RE = /\b(i\s*don'?t\s*(?:want|wanna|know|have)|not\s*(?:sure|now|right\s*now|yet)|no\s*idea|skip|maybe\s*later|prefer\s*not|rather\s*not|none\s*of\s*your)\b/i;
+const DECLINE_RE = /\b(i\s*don'?t\s*(?:want|wanna|know|have)|not\s*(?:sure|now|right\s*now|yet)|no\s*idea|skip|maybe\s*later|prefer\s*not|rather\s*not|none\s*of\s*your|won'?t\s*tell|wont\s*tell|mind\s*your\s*own|not\s*telling)\b/i;
 
 // ─────────────────────────────────────────────
 // PHASE-AWARE ENTITY EXTRACTION
@@ -854,8 +879,14 @@ function onboardingPrompt(mem) {
       return `Got it${name ? ', ' + name : ''}! 🌍\n\nAnd which country or market are you looking to expand into? (e.g. USA, UK, UAE, Singapore, or a region like ASEAN, EU, GCC)`;
     case 'onboarding_contact': {
       const target = mem.targetCountry || (mem.targetCountries && mem.targetCountries[0]) || null;
-      const marketLine = target ? `${target} is an excellent market for expansion. 🌍` : `Let's get you connected with the right team. 🌍`;
-      return `Great choice${name ? ', ' + name : ''}! ${marketLine}\n\nBefore we dive deeper, could I grab your email or WhatsApp number? Please include the country code for your phone (e.g. +91 India, +1 USA, +971 UAE, +63 Philippines, +65 Singapore). Our team will use it to send you a custom quote and specific insights${target ? ' for ' + target : ''}.`;
+      // The opener now reflects HOW the target market was resolved, instead
+      // of always saying "Great choice!" — which read as tone-deaf when the
+      // user had actually just refused to answer (e.g. "none of your
+      // business") rather than genuinely picking a market.
+      const opener = mem.targetSkipped
+        ? `No problem${name ? ', ' + name : ''} — we can go ahead without a specific target market for now. 🌍`
+        : `Great choice${name ? ', ' + name : ''}! ${target ? target + ' is an excellent market for expansion. 🌍' : ''}`;
+      return `${opener}\n\nBefore we dive deeper, could I grab your email or WhatsApp number? Please include the country code for your phone (e.g. +91 India, +1 USA, +971 UAE, +63 Philippines, +65 Singapore). Our team will use it to send you a custom quote and specific insights${target ? ' for ' + target : ''}.`;
     }
     default: return null;
   }
@@ -1571,7 +1602,7 @@ app.get('/', function(req, res) { res.sendFile(path.join(__dirname, 'public', 'i
 const PORT = process.env.PORT || 5000;
 connectMongo().then(function() {
   app.listen(PORT, function() {
-    console.log('\n🚀 Connect Ventures Website Bot v1.2 — phase-aware, region-safe, stall-safe, stale-session-safe extraction');
+    console.log('\n🚀 Connect Ventures Website Bot v1.3 — name-prefix-fallback, decline-aware onboarding_contact opener');
     console.log('📡 Port: ' + PORT);
     console.log('💬 POST /api/chat');
     console.log('📝 POST /api/chat/contact-form');
