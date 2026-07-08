@@ -1427,7 +1427,8 @@ app.post('/api/chat/contact-form', async function(req, res) {
     if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
 
     const session = await getSession(sessionId);
-    const mem = session.memory;
+    const mem = session.memory, state = session.state;
+    const priorPhase = computePhase(mem);
 
     if (name && name.trim()) mem.name = toTitleCase(name.trim());
     if (companyName && companyName.trim()) mem.companyName = companyName.trim();
@@ -1448,22 +1449,71 @@ app.post('/api/chat/contact-form', async function(req, res) {
     }
 
     syncPhase(session);
+
+    // Log this as a real turn in the conversation, so the widget's
+    // restored chat history (see GET /api/chat/session/:id) shows it
+    // like any other exchange rather than silently vanishing.
+    const submittedParts = [];
+    if (name && name.trim()) submittedParts.push('Name: ' + name.trim());
+    if (email && email.trim()) submittedParts.push('Email: ' + email.trim());
+    if (phone && phone.trim()) submittedParts.push('Phone: ' + phone.trim());
+    session.history.push({ role: 'user', content: truncateMsg('[Submitted contact form] ' + submittedParts.join(', ')) });
+
+    let reply;
+    const contactJustReceived = !!(mem.email || mem.phone);
+    if (contactJustReceived && priorPhase === 'onboarding_contact') {
+      const nameGreet = mem.name || 'there';
+      const contactType = mem.email ? `email (${mem.email})` : `number (${mem.phone})`;
+      const target = mem.targetCountry || (mem.targetCountries && mem.targetCountries[0]) || 'your target market';
+      reply = `Perfect, ${nameGreet}! I've got your ${contactType}. 📧\n\nOur team will be in touch with tailored information about expanding to ${target}. Now — what aspect would you like to explore first?\n\nWant to explore further?\n1️⃣ What does market entry look like in ${target}?\n2️⃣ What are the banking and compliance requirements?\n3️⃣ How does Connect Ventures' 5C framework help here?\n4️⃣ What's a realistic timeline and cost?`;
+      const menu = parseMenuFromReply(reply);
+      if (menu) state.lastMenu = { options: menu, context: 'contact_received', createdAt: Date.now() };
+      state.leadSaved = true;
+    } else if (name && name.trim() && priorPhase === 'onboarding_name') {
+      reply = onboardingPrompt(mem); // moves on to the next onboarding question
+    } else {
+      reply = `Thanks, ${mem.name || 'there'} — got it! 🙌`;
+    }
+    session.history.push({ role: 'assistant', content: truncateMsg(reply) });
     await saveSession(session);
 
     if (mem.email || mem.phone) {
       await saveLeadData(session, true);
       await appendToSheet(session);
-      if (!session.state.leadSaved) {
-        session.state.leadSaved = true;
+      if (!state.leadSaved) {
+        state.leadSaved = true;
         await sendLeadEmail(session);
         await saveSession(session);
       }
     }
 
-    res.json({ success: true, phase: session.state.phase, name: mem.name });
+    res.json({ success: true, phase: state.phase, name: mem.name, reply });
   } catch (err) {
     console.error('❌ contact-form error:', err.message);
     res.status(500).json({ error: 'Could not save contact info.' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// SESSION STATE — lets the widget restore an existing conversation
+// (history + phase) on open instead of always showing a hardcoded
+// greeting. This is the fix for the "widget looks brand new but the
+// backend already has my name from days ago" problem: the widget should
+// ask the backend what it actually knows before deciding what to show.
+// Deliberately returns only chat-safe fields — no email/phone/internal
+// state — since this is a public, unauthenticated endpoint.
+// ─────────────────────────────────────────────
+app.get('/api/chat/session/:sessionId', async function(req, res) {
+  try {
+    const session = await getSession(req.params.sessionId);
+    res.json({
+      history: session.history.map(m => ({ role: m.role, content: m.content })),
+      phase: session.state.phase === 'new' ? computePhase(session.memory) : session.state.phase,
+      name: session.memory.name || null,
+    });
+  } catch (err) {
+    console.error('❌ session-state error:', err.message);
+    res.status(500).json({ history: [], phase: 'onboarding_name', name: null });
   }
 });
 
