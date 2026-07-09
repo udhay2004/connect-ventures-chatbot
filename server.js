@@ -73,6 +73,12 @@ const NOTIFY_EMAIL       = (process.env.NOTIFY_EMAIL       || 'anil.gupta@thecon
 const FROM_EMAIL         = (process.env.FROM_EMAIL         || 'Connect Ventures Bot <onboarding@resend.dev>').trim();
 const KEEP_ALIVE_URL     = (process.env.KEEP_ALIVE_URL     || '').trim();
 
+// Partner-linkage: posts a pending Campaign to cvbackend once a founder
+// consents to being connected with the partner network. SERVICE_API_KEY
+// must match the SERVICE_API_KEY set on the cvbackend deployment.
+const CVBACKEND_URL   = (process.env.CVBACKEND_URL   || '').trim().replace(/\/$/, '');
+const SERVICE_API_KEY = (process.env.SERVICE_API_KEY || '').trim();
+
 const EXTRACTOR_MODEL = 'claude-haiku-4-5-20251001';
 const ADVISOR_MODEL   = 'claude-sonnet-4-6';
 const SUMMARY_MODEL   = 'claude-haiku-4-5-20251001';
@@ -586,6 +592,7 @@ ONBOARDING — you drive this conversationally, there is no fixed script:
 
 ADVISORY MODE:
 - Answer using the knowledge above and any knowledge-base excerpts provided. If unsure which of the 5 Cs applies, ask a brief clarifying question.
+- If [USER CONTEXT] includes a PARTNER_OFFER note, weave in one natural, low-pressure offer to connect them with people in the Connect Ventures partner network who specifically work on what they just described — and ask for a clear yes/no. Only do this once; if they say no or don't engage with it, don't bring it up again.
 - After a substantive advisory answer, end with a short numbered list of 4 natural follow-up options, formatted like:
 
 Want to explore further?
@@ -629,6 +636,8 @@ const EXTRACTOR_TOOL = {
       serviceInterest: { type: 'string', description: 'One of: Coaching, Consulting, Connecting, Collaboration, Co-creation, Incorporation, Banking, Taxation, FEMA/ODI, Fundraising, Marketplace, Partner Network — whichever the user is currently asking about. Null if unclear/general.' },
       fieldDeclined: { type: 'string', enum: ['name', 'currentCountry', 'targetCountry', 'contact', 'none'], description: 'Set this to whichever pending onboarding field (given in context) the user is explicitly refusing to answer, stalling on, or saying "skip"/"none of your business"/similar for, in ANY language. Otherwise "none".' },
       pendingConfirmationAnswer: { type: 'string', enum: ['yes', 'no', 'unclear', 'not_applicable'], description: 'ONLY relevant if the context says a name-change confirmation is pending — resolve whether this message means yes, no, or is unclear, in ANY language. Otherwise "not_applicable".' },
+      licenseOrRegulation: { type: 'string', description: 'A specific license, certification, permit, or regulatory body the user names this turn, e.g. FSSAI, FDA, CE Mark, GDPR, ISO 9001. Null if none mentioned.' },
+      readyToPublish: { type: 'boolean', description: 'True ONLY if the user just gave a clear yes to being connected with / introduced to partners in the Connect Ventures network who can help with their specific need (this must be an explicit affirmative answer to that specific offer, not general interest or enthusiasm). Omit/false otherwise — never infer consent.' },
     },
     required: ['fieldDeclined', 'pendingConfirmationAnswer'],
   },
@@ -793,6 +802,18 @@ async function applyExtraction(session, extracted, rawMessage) {
     if (!mem.serviceNeeded) mem.serviceNeeded = svc;
   }
 
+  // Named license/regulation (e.g. "FSSAI") — feeds the campaign posted to cvbackend.
+  if (extracted.licenseOrRegulation && typeof extracted.licenseOrRegulation === 'string' && extracted.licenseOrRegulation.trim()) {
+    mem.licenseOrRegulation = extracted.licenseOrRegulation.trim();
+  }
+
+  // Explicit consent to be connected with the partner network — never inferred
+  // deterministically here, only ever set by the extractor model above, and
+  // only ever moves from false -> true, never back.
+  if (extracted.readyToPublish === true) {
+    mem.readyToPublish = true;
+  }
+
   // Email — deterministic extraction + validation, independent of language
   if (!mem.email) {
     const candidateRaw = extractEmailFromText(rawMessage) || extracted.possibleEmail || null;
@@ -880,6 +901,12 @@ function buildContextBlock(mem, state, notes) {
   if (!mem.email && !mem.phone && state.phase === 'advisory' && !state.contactNudgeSent) {
     lines.push('\nCONTACT_NUDGE (one time only): after fully answering their question, add one natural line asking for their email or phone so the team can send tailored follow-up. Do not repeat this again later.');
     state.contactNudgeSent = true;
+  }
+  const hasContact = !!(mem.email || mem.phone);
+  const hasServiceAndMarket = !!((mem.serviceNeeded || (mem.servicesDiscussed && mem.servicesDiscussed.length)) && countries.length);
+  if (hasContact && hasServiceAndMarket && !mem.readyToPublish && !mem.campaignPosted && !state.partnerOfferSent) {
+    lines.push('\nPARTNER_OFFER (one time only): see the ADVISORY MODE instruction above about offering to connect them with the partner network.');
+    state.partnerOfferSent = true;
   }
   return '\n\n[USER CONTEXT — ground truth, overrides anything implied by chat history]\n' + lines.join('\n');
 }
@@ -976,6 +1003,7 @@ async function saveLeadData(session, isComplete) {
   } catch (err) { console.error('❌ saveLeadData error:', err.message); }
 
   if (mem.email || mem.phone) await syncToSharedCRM(session);
+  if (mem.readyToPublish) await createCampaignFromSession(session);
 }
 
 async function syncToSharedCRM(session) {
@@ -992,6 +1020,58 @@ async function syncToSharedCRM(session) {
     const filter = mem.email ? { email: mem.email, source: 'chatbot' } : { phone: mem.phone, source: 'chatbot' };
     await crmLeadsCol.updateOne(filter, { $set: { ...doc, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
   } catch (err) { console.error('❌ syncToSharedCRM error:', err.message); }
+}
+
+// Posts a pending Campaign to cvbackend once a founder has (a) given
+// explicit consent to being connected with the partner network, and
+// (b) given us enough to actually build a campaign from. cvbackend always
+// creates it as 'pending' — a human approves it there before any partner
+// gets emailed. mem.campaignPosted guards against posting the same
+// conversation twice as the summary keeps refreshing.
+async function createCampaignFromSession(session) {
+  const mem = session.memory;
+  if (mem.campaignPosted) return;
+  if (!mem.readyToPublish) return;
+  if (!CVBACKEND_URL || !SERVICE_API_KEY) {
+    console.warn('⚠️ CVBACKEND_URL/SERVICE_API_KEY not set — skipping campaign post.');
+    return;
+  }
+
+  const targetCountry = mem.targetCountry || (mem.targetCountries && mem.targetCountries[0]);
+  const service = mem.serviceNeeded || (mem.servicesDiscussed && mem.servicesDiscussed[0]);
+  if (!targetCountry || !service || !(mem.email || mem.phone)) return; // not enough to build a useful campaign yet
+
+  const license = mem.licenseOrRegulation || service;
+  const title = service + ' support in ' + targetCountry;
+
+  const payload = {
+    title: title,
+    originCountry: mem.currentCountry || 'Not specified',
+    destCountry: targetCountry,
+    topic: service,
+    license: license,
+    blurb: (mem.conversationSummary || ('A founder is looking for help with ' + service + ' in ' + targetCountry + '.')).slice(0, 280),
+    details: mem.conversationSummary || ('Conversation via website chatbot. Service: ' + service + '. Target market: ' + targetCountry + '.'),
+    postedAs: mem.currentCountry ? ('A founder from ' + mem.currentCountry) : 'A founder on the Connect Ventures website',
+    contactEmail: mem.email || '',
+    extractedTags: [targetCountry, service, license].filter(Boolean),
+  };
+
+  try {
+    const r = await fetch(CVBACKEND_URL + '/api/campaigns', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-service-key': SERVICE_API_KEY },
+      body: JSON.stringify(payload),
+    });
+    if (r.ok) {
+      mem.campaignPosted = true;
+      console.log('✅ Campaign posted for session ' + session.sessionId + ' — ' + title);
+    } else {
+      console.error('❌ Campaign post failed (' + r.status + '):', await r.text());
+    }
+  } catch (err) {
+    console.error('❌ Campaign post error:', err.message);
+  }
 }
 
 async function appendToSheet(session) {
