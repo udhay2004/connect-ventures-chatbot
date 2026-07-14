@@ -1119,7 +1119,18 @@ async function createCampaignFromSession(session) {
       mem.campaignPosted = true;
       console.log('✅ Campaign posted for session ' + session.sessionId + ' — ' + title);
     } else {
-      console.error('❌ Campaign post failed (' + r.status + '):', await r.text());
+      // Don't dump the raw body — on a 502/503 that's Render's auto-generated
+      // error page (often hundreds of KB with embedded base64 fonts), which
+      // floods the console with noise instead of useful information.
+      const bodyText = await r.text().catch(() => '');
+      const looksLikeHtml = /^\s*<(!doctype|html)/i.test(bodyText);
+      console.error(
+        '❌ Campaign post failed (' + r.status + ')' +
+        (r.status === 502 || r.status === 503
+          ? ' — cvbackend appears to be down/unreachable (cold start or crash), not a data issue.'
+          : '') +
+        (looksLikeHtml ? '' : ': ' + bodyText.slice(0, 300))
+      );
     }
   } catch (err) {
     console.error('❌ Campaign post error:', err.message);
