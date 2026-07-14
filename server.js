@@ -338,9 +338,52 @@ async function validateEmail(rawInput, options) {
   if (preCleaned.hadTypo) console.log('🔧 Auto-fixed email: "' + rawInput.trim() + '" to "' + trimmed + '"');
   const FORMAT_RE = /^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/;
   if (!FORMAT_RE.test(trimmed)) return { valid: false, reason: 'format', attempted: rawInput.trim() };
-  const TYPO_TLDS = ['.cmo','.cim','.con','.cpm','.ocm','.kom','.conm','.coom','.gmal','.gmial','.yaho','.yhaoo','.gamil','.gmaill','.cm','.om'];
-  if (TYPO_TLDS.some(t => trimmed.endsWith(t))) return { valid: false, reason: 'typo_tld', attempted: trimmed };
+  // Fixed-format typos: known-bad top-level domains (checked against the TLD
+  // itself now, not a suffix match, so it can't accidentally match a real
+  // TLD that happens to end the same way).
   const domain = trimmed.split('@')[1];
+  const domainParts = domain.split('.');
+  const tld = domainParts[domainParts.length - 1];
+  const TYPO_TLDS = [
+    'cmo','cim','con','cpm','ocm','kom','conm','coom','cm','om','vom','xom','nom',
+    'comm','coma','comn','clm','ckm','vcom','bom','dom','xcom','ccom',
+  ];
+  if (TYPO_TLDS.includes(tld)) return { valid: false, reason: 'typo_tld', attempted: trimmed };
+  // Known providers with a fixed real domain — if the domain is a
+  // one-character edit away from one of these (e.g. "gmial.com",
+  // "gmail.con", "gnail.com") it's virtually always a typo. This check is
+  // local (no network call), so unlike the DNS check below it can't fail
+  // open when the network is slow or unavailable.
+  const KNOWN_PROVIDERS = ['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','protonmail.com','aol.com','live.com','rediffmail.com'];
+  function isEditDistance1(a, b) {
+    if (a === b) return false;
+    if (a.length === b.length) {
+      // Same length: either exactly one substitution, or one adjacent
+      // transposition (e.g. "gmial" vs "gmail" — a common typo pattern
+      // a plain substitution-only check misses).
+      let diffPositions = [];
+      for (let k = 0; k < a.length; k++) if (a[k] !== b[k]) diffPositions.push(k);
+      if (diffPositions.length === 1) return true;
+      if (diffPositions.length === 2) {
+        const [p, q] = diffPositions;
+        if (q === p + 1 && a[p] === b[q] && a[q] === b[p]) return true;
+      }
+      return false;
+    }
+    if (Math.abs(a.length - b.length) !== 1) return false;
+    // One insertion/deletion apart.
+    let i = 0, j = 0, diffs = 0;
+    while (i < a.length && j < b.length) {
+      if (a[i] === b[j]) { i++; j++; continue; }
+      if (++diffs > 1) return false;
+      if (a.length > b.length) i++;
+      else j++;
+    }
+    return true;
+  }
+  if (KNOWN_PROVIDERS.some(p => isEditDistance1(domain, p))) {
+    return { valid: false, reason: 'typo_domain', attempted: trimmed };
+  }
   const FAKE_DOMAINS = new Set([
     'test.com','example.com','example.org','example.net','fake.com','noemail.com','noreply.com',
     'invalid.com','mailinator.com','guerrillamail.com','trashmail.com','throwam.com',
@@ -421,10 +464,19 @@ function validatePhone(rawPhone, currentCountry) {
     (digitsOnly.startsWith('91') && digitsOnly.length === 12) ||
     (currentCountry === 'India' && !hasPlus && digitsOnly.length === 10);
   if (isIndiaContext) {
+    // Strip whatever prefix is actually present (+91 / 091 / 91 / trunk 0)
+    // based on what the string STARTS WITH, not on the total digit count.
+    // The old length===12/13/11 equality checks silently skipped the
+    // strip whenever the local part was the wrong length (e.g. "+91
+    // 844822798", a 9-digit number = 11 digits total, not 12) — so the
+    // "91" was left glued onto the front and treated as part of the local
+    // number instead of the country code, which could mis-validate
+    // numbers that are actually too short or too long.
     let local = digitsOnly;
-    if (local.startsWith('091') && local.length === 13) local = local.slice(3);
-    else if (local.startsWith('91') && local.length === 12) local = local.slice(2);
-    else if (local.startsWith('0') && local.length === 11) local = local.slice(1);
+    if (hasPlus && stripped.startsWith('+91')) local = digitsOnly.slice(2);
+    else if (local.startsWith('091')) local = local.slice(3);
+    else if (local.startsWith('91') && local.length > 10) local = local.slice(2);
+    else if (local.startsWith('0') && local.length > 10) local = local.slice(1);
     if (local.length < 10) return { valid: false, reason: 'too_short_india', cleaned: null };
     if (local.length > 10) return { valid: false, reason: 'too_long_india', cleaned: null };
     if (!/^[6-9]/.test(local)) return { valid: false, reason: 'invalid_india_prefix', cleaned: null };
