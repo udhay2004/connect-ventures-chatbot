@@ -87,8 +87,23 @@ const SUMMARY_MODEL   = 'claude-haiku-4-5-20251001';
   ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY],
   ['MONGODB_URI',       MONGODB_URI],
 ].forEach(function(pair) {
-  if (!pair[1]) console.error('❌ ENV MISSING: ' + pair[0]);
+  if (!pair[1]) console.error('❌ ENV MISSING (required): ' + pair[0]);
   else          console.log('✅ ENV loaded: ' + pair[0]);
+});
+
+// These aren't fatal to boot — the server still runs without them — but
+// each one silently disables a specific feature, and previously that only
+// showed up as a one-line console.warn buried in request logs at the exact
+// moment someone hit the code path. Surfacing them all at startup means
+// "why didn't I get an email" is answerable by scrolling to the top of the
+// logs instead of reproducing the bug.
+[
+  ['CVBACKEND_URL',   CVBACKEND_URL,   'partner-query campaigns will NOT be posted to the CRM'],
+  ['SERVICE_API_KEY', SERVICE_API_KEY, 'partner-query campaigns will NOT be posted to the CRM'],
+  ['RESEND_API_KEY',  RESEND_API_KEY,  'lead notification emails will NOT be sent'],
+].forEach(function(pair) {
+  if (!pair[1]) console.warn('⚠️ ENV MISSING (optional but disables a feature): ' + pair[0] + ' — ' + pair[2]);
+  else           console.log('✅ ENV loaded: ' + pair[0]);
 });
 
 // ─────────────────────────────────────────────
@@ -1091,7 +1106,13 @@ async function createCampaignFromSession(session) {
 
   const targetCountry = mem.targetCountry || (mem.targetCountries && mem.targetCountries[0]);
   const service = mem.serviceNeeded || (mem.servicesDiscussed && mem.servicesDiscussed[0]);
-  if (!targetCountry || !service || !(mem.email || mem.phone)) return; // not enough to build a useful campaign yet
+  if (!targetCountry || !service || !(mem.email || mem.phone)) {
+    console.warn(
+      '⚠️ readyToPublish=true but campaign not posted (session ' + session.sessionId + ') — missing: ' +
+      [!targetCountry && 'targetCountry', !service && 'service', !(mem.email || mem.phone) && 'email/phone'].filter(Boolean).join(', ')
+    );
+    return; // not enough to build a useful campaign yet
+  }
 
   const license = mem.licenseOrRegulation || service;
   const title = service + ' support in ' + targetCountry;
@@ -1105,7 +1126,9 @@ async function createCampaignFromSession(session) {
     blurb: (mem.conversationSummary || ('A founder is looking for help with ' + service + ' in ' + targetCountry + '.')).slice(0, 280),
     details: mem.conversationSummary || ('Conversation via website chatbot. Service: ' + service + '. Target market: ' + targetCountry + '.'),
     postedAs: mem.currentCountry ? ('A founder from ' + mem.currentCountry) : 'A founder on the Connect Ventures website',
+    contactName: mem.name || '',
     contactEmail: mem.email || '',
+    contactPhone: mem.phone || '',
     extractedTags: [targetCountry, service, license].filter(Boolean),
   };
 
