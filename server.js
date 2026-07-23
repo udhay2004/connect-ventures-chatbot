@@ -923,9 +923,18 @@ async function applyExtraction(session, extracted, rawMessage) {
     } else if (!gotSomethingThisTurn) {
       state.stallCount = (state.stallCount || 0) + 1;
       if (state.stallCount >= 3) {
-        mem[fieldMap[currentFieldKey]] = true;
         state.stallCount = 0;
-        notes.push('FIELD_AUTO_SKIPPED: user hasn\'t provided ' + currentFieldKey + ' after repeated asks — move on gracefully without dwelling on it.');
+        if (currentFieldKey === 'contact') {
+          // Contact info is the one field we should never silently give up
+          // on just because a few turns passed without it — someone asking
+          // follow-up questions before sharing an email is normal, not a
+          // decline. Only an explicit decline (handled above) should ever
+          // set contactSkipped. Here we just stop nagging for this turn.
+          notes.push('CONTACT_STILL_PENDING: user hasn\'t shared contact info after repeated asks. Don\'t re-ask it this specific turn or sound naggy about it, but do NOT treat it as declined — a natural opening to ask again later in the conversation is fine.');
+        } else {
+          mem[fieldMap[currentFieldKey]] = true;
+          notes.push('FIELD_AUTO_SKIPPED: user hasn\'t provided ' + currentFieldKey + ' after repeated asks — move on gracefully without dwelling on it.');
+        }
       }
     } else {
       state.stallCount = 0;
