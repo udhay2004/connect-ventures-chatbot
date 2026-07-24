@@ -696,7 +696,7 @@ const EXTRACTOR_TOOL = {
       name: { type: 'string', description: 'The user\'s first name / preferred name, ONLY if newly stated this turn. Proper-case it. Null if not mentioned.' },
       nameChangeIntent: { type: 'boolean', description: 'True if the user appears to be correcting or replacing a name already on file, rather than stating it for the first time.' },
       currentCountry: { type: 'string', description: 'Country (or city clearly implying a country) the user says they are CURRENTLY based in / operating from, in English. Null if not mentioned this turn.' },
-      targetCountries: { type: 'array', items: { type: 'string' }, description: 'Any NEW country, market, or regional bloc (e.g. ASEAN, EU, GCC) the user says they want to expand into, mentioned this turn, in English. Empty array if none.' },
+      targetCountries: { type: 'array', items: { type: 'string' }, description: 'Any NEW country, market, or regional bloc (e.g. ASEAN, EU, GCC) the user CLEARLY STATES as somewhere they want to expand into or are targeting, mentioned this turn, in English. Do NOT record a region just because they asked a question about it, compared it to another market, or mentioned it in passing while still deciding — that is not a commitment. Empty array if the intent isn\'t clearly expressed yet.' },
       companyName: { type: 'string', description: 'Company/business name, if newly mentioned this turn. Null otherwise.' },
       possibleEmail: { type: 'string', description: 'Raw email-looking text in the message (even with typos, spoken-out format, or missing @), verbatim. Null if none.' },
       possiblePhone: { type: 'string', description: 'Raw phone-number-looking text in the message, verbatim, including any country code the user gave. Null if none.' },
@@ -969,6 +969,9 @@ function buildContextBlock(mem, state, notes) {
   if (state.topicsDiscussed && state.topicsDiscussed.length) lines.push('Topics covered previously: ' + state.topicsDiscussed.join(', '));
   if (mem.conversationSummary) lines.push('Summary of the conversation so far: ' + mem.conversationSummary);
   lines.push('Onboarding phase: ' + state.phase);
+  if (state.phase === 'onboarding_contact') {
+    lines.push('\n>>> MANDATORY THIS TURN: you must directly ask for an email or phone number before moving on to anything else, unless the user has just explicitly declined to share it in their latest message. Do not let an interesting question from the user distract you into pure advisory chat yet — briefly acknowledge what they said, then ask for the contact info in the same reply. This is not optional.');
+  }
   if (state.lastMenu) {
     const mn = state.lastMenu;
     lines.push('\n[ACTIVE MENU — context: "' + mn.context + '"]\n1. ' + mn.options[0] + '\n2. ' + mn.options[1] + '\n3. ' + mn.options[2] + '\n4. ' + mn.options[3]);
@@ -1419,14 +1422,25 @@ app.get('/health', function(req, res) {
   res.json({ status: 'ok', uptime: Math.round(process.uptime()), mongodb: { connected: mongoOk, error: mongoError || null }, rateLimitActive: Date.now() < _rateLimitUntil });
 });
 
-app.get('/leads', async function(req, res) {
+// SECURITY: these routes expose or can delete lead PII (names, emails,
+// phones, full chat summaries) and previously had ZERO authentication —
+// anyone with the URL could dump every lead or wipe any session. Require
+// the same shared secret used across the rest of the stack.
+function requireAdmin(req, res, next) {
+  const key = process.env.ADMIN_API_KEY;
+  if (!key) return res.status(500).json({ error: 'ADMIN_API_KEY not configured on this service' });
+  if (req.headers['x-admin-key'] !== key) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+app.get('/leads', requireAdmin, async function(req, res) {
   const ready = await ensureMongo();
   if (!ready || !leadsCol) return res.json([]);
   try { res.json(await leadsCol.find({}).sort({ createdAt: -1 }).limit(500).toArray()); }
   catch (err) { res.json([]); }
 });
 
-app.get('/leads/stats', async function(req, res) {
+app.get('/leads/stats', requireAdmin, async function(req, res) {
   const ready = await ensureMongo();
   if (!ready || !leadsCol) return res.json({ error: 'MongoDB not connected' });
   try {
@@ -1438,19 +1452,19 @@ app.get('/leads/stats', async function(req, res) {
   } catch (err) { res.json({ error: err.message }); }
 });
 
-app.get('/leads/complete', async function(req, res) {
+app.get('/leads/complete', requireAdmin, async function(req, res) {
   const ready = await ensureMongo();
   if (!ready || !leadsCol) return res.json([]);
   try { res.json(await leadsCol.find({ $or: [{ email: { $ne: null, $exists: true } }, { phone: { $ne: null, $exists: true } }] }).sort({ createdAt: -1 }).limit(500).toArray()); }
   catch (err) { res.json([]); }
 });
 
-app.get('/debug/:sessionId', async function(req, res) {
+app.get('/debug/:sessionId', requireAdmin, async function(req, res) {
   const session = await getSession(req.params.sessionId);
   res.json({ memory: session.memory, state: session.state, historyLength: session.history.length, lastMessages: session.history.slice(-4) });
 });
 
-app.post('/reset/:sessionId', async function(req, res) {
+app.post('/reset/:sessionId', requireAdmin, async function(req, res) {
   const id = req.params.sessionId;
   _cache.session.delete(id);
   if (sessionsCol) await sessionsCol.deleteOne({ sessionId: id }).catch(() => {});
